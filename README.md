@@ -27,8 +27,8 @@ A terminal CLI for tracking domain names in pending-delete, monitoring their RDA
 Clone the repository and install with `pipx`:
 
 ```sh
-git clone https://github.com/youruser/PDT.git
-cd PDT
+git clone https://github.com/danilopatrial/pdt.git
+cd pdt
 pipx install .
 ```
 
