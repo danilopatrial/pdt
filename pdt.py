@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -22,13 +22,27 @@ from rich.text import Text
 
 console = Console()
 
-DATA_DIR = Path.home() / ".pdt"
-DATA_FILE = DATA_DIR / "domains.json"
-PID_FILE = DATA_DIR / "daemon.pid"
-LOG_FILE = DATA_DIR / "daemon.log"
+DATA_DIR   = Path.home() / ".pdt"
+DATA_FILE  = DATA_DIR / "domains.json"
+CONFIG_FILE = DATA_DIR / "config.json"
+PID_FILE   = DATA_DIR / "daemon.pid"
+LOG_FILE   = DATA_DIR / "daemon.log"
 
 NOTIFY_WINDOW = 300        # 5 minutes
 ARCHIVE_AFTER = 24 * 3600  # 24 hours past drop time
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {}
+
+
+def save_config(cfg: dict):
+    DATA_DIR.mkdir(exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
@@ -74,23 +88,20 @@ def parse_duration(s: str) -> float:
 
 
 def fmt_duration(secs: float) -> str:
-    """Total seconds → '1d3h57m'"""
+    """Total seconds → fixed-width string like '1d 03h 51m 00s'"""
     if secs <= 0:
         return "NOW"
     td = timedelta(seconds=int(secs))
     d = td.days
     h, rem = divmod(td.seconds, 3600)
     m, s = divmod(rem, 60)
-    parts = []
     if d:
-        parts.append(f"{d}d")
+        return f"{d}d {h:02d}h {m:02d}m {s:02d}s"
     if h:
-        parts.append(f"{h}h")
+        return f"{h:02d}h {m:02d}m {s:02d}s"
     if m:
-        parts.append(f"{m}m")
-    if s or not parts:
-        parts.append(f"{s}s")
-    return "".join(parts)
+        return f"{m:02d}m {s:02d}s"
+    return f"{s:02d}s"
 
 
 def find_domain(domains: list, name: str):
@@ -99,6 +110,11 @@ def find_domain(domains: list, name: str):
         if d["domain"] == name:
             return d
     return None
+
+
+def to_local(dt: datetime) -> datetime:
+    """Convert a naive UTC datetime to the local timezone."""
+    return dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
 
 
 def remaining(entry: dict) -> float:
@@ -121,24 +137,33 @@ def status_style(status: str) -> str:
 
 def rdap_lookup(domain: str) -> str:
     """Return RDAP status string. Returns 'available' on 404."""
+    url = f"https://rdap.org/domain/{domain}"
+    vlog(f"GET {url}")
     try:
         r = requests.get(
-            f"https://rdap.org/domain/{domain}",
+            url,
             timeout=10,
             allow_redirects=True,
             headers={"Accept": "application/rdap+json, application/json"},
         )
+        vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
         if r.status_code == 404:
+            vlog("404 → available")
             return "available"
         r.raise_for_status()
         data = r.json()
         statuses = data.get("status", [])
-        return ", ".join(statuses) if statuses else "active"
+        result = ", ".join(statuses) if statuses else "active"
+        vlog(f"statuses: {statuses!r} → {result!r}")
+        return result
     except requests.HTTPError as e:
+        vlog(f"HTTP error: {e}")
         return f"http-error-{e.response.status_code}"
     except requests.Timeout:
+        vlog("request timed out")
         return "timeout"
-    except Exception:
+    except Exception as e:
+        vlog(f"exception: {e}")
         return "fetch-error"
 
 
@@ -166,14 +191,27 @@ def send_notification(title: str, msg: str):
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+VERBOSE = False
+
+
+def vlog(msg: str):
+    """Print a verbose-mode message."""
+    if VERBOSE:
+        console.print(f"[dim blue]  [v] {msg}[/dim blue]")
+
+
 @click.group()
 @click.version_option("1.0.0", prog_name="pdt")
-def cli():
+@click.option("-v", "--verbose", is_flag=True, default=False,
+              help="Show detailed output including API requests and responses.")
+def cli(verbose):
     """PDT — Pending Delete Domain Tracker
 
     Track domains in pending-delete and get desktop notifications
     5 minutes before they become available.
     """
+    global VERBOSE
+    VERBOSE = verbose
 
 
 # ── add ───────────────────────────────────────────────────────────────────────
@@ -241,6 +279,28 @@ def remove(domain):
         sys.exit(1)
     save(new)
     console.print(f"[green]✓ Removed[/green] [bold]{domain}[/bold]")
+
+
+# ── flag ─────────────────────────────────────────────────────────────────────
+
+@cli.command()
+@click.argument("domains", nargs=-1, required=True)
+def flag(domains):
+    """Toggle the flag on one or more domains (highlighted in list)."""
+    tracked = load()
+    changed = False
+    for name in domains:
+        name = name.lower().strip()
+        entry = find_domain(tracked, name)
+        if entry is None:
+            console.print(f"[red]Not found: [bold]{name}[/bold][/red]")
+            continue
+        entry["flagged"] = not entry.get("flagged", False)
+        state = "[yellow]⚑ flagged[/yellow]" if entry["flagged"] else "[dim]unflagged[/dim]"
+        console.print(f"[bold cyan]{name}[/bold cyan] → {state}")
+        changed = True
+    if changed:
+        save(tracked)
 
 
 # ── update ────────────────────────────────────────────────────────────────────
@@ -384,11 +444,11 @@ def list_domains(machine, sort, show_archived):
     if show_archived:
         table.add_column("Dropped", justify="right", no_wrap=True, min_width=8)
         if show_drop_time:
-            table.add_column("Dropped At (UTC)", justify="center", no_wrap=True, min_width=12)
+            table.add_column("Dropped At", justify="center", no_wrap=True, min_width=12)
     else:
         table.add_column("Drops In", justify="right", no_wrap=True, min_width=6)
         if show_drop_time:
-            table.add_column("Drop Time (UTC)", justify="center", no_wrap=True, min_width=12)
+            table.add_column("Drop Time", justify="center", no_wrap=True, min_width=12)
 
     if show_appraisal:
         table.add_column("Appraisal", justify="right", no_wrap=True, min_width=8)
@@ -404,10 +464,11 @@ def list_domains(machine, sort, show_archived):
         appraisal = f"${d['appraisal']:,.0f}" if d.get("appraisal") else "—"
         st = d.get("status", "unknown")
 
+        local_dt = to_local(drop_dt)
         if show_archived:
             ago = -rem  # positive = seconds since drop
             time_cell = Text(fmt_duration(ago) + " ago", style="dim")
-            date_str  = drop_dt.strftime("%b %d  %H:%M")
+            date_str  = local_dt.strftime("%b %d  %H:%M")
         else:
             rem_str = fmt_duration(rem)
             if rem <= 0:
@@ -418,12 +479,16 @@ def list_domains(machine, sort, show_archived):
                 time_cell = Text(rem_str, style="yellow")
             else:
                 time_cell = Text(rem_str, style="white")
-            date_str = drop_dt.strftime("%b %d  %H:%M")
+            date_str = local_dt.strftime("%b %d  %H:%M")
+
+        flagged = d.get("flagged", False)
+        domain_cell = Text(("⚑ " if flagged else "") + d["domain"],
+                           style="bold yellow" if flagged else "bold cyan")
 
         row = []
         if show_index:
             row.append(str(i))
-        row.append(d["domain"])
+        row.append(domain_cell)
         row.append(time_cell)
         if show_drop_time:
             row.append(date_str)
@@ -438,7 +503,7 @@ def list_domains(machine, sort, show_archived):
     console.print(table)
     total = len(domains)
     label = "archived domain" if show_archived else "domain"
-    console.print(f"[dim]  {total} {label}{'s' if total != 1 else ''} · times in UTC[/dim]")
+    console.print(f"[dim]  {total} {label}{'s' if total != 1 else ''} · times in local timezone[/dim]")
 
 
 # ── next ──────────────────────────────────────────────────────────────────────
@@ -495,6 +560,149 @@ def next_cmd(count, machine):
             parts.append(f"[dim]{d['note']}[/dim]")
 
         console.print("  ".join(parts))
+
+
+# ── appraise ──────────────────────────────────────────────────────────────────
+
+def atom_appraise(domain: str, api_token: str, user_id: int) -> float | None:
+    """Fetch estimated market value from Atom's appraisal API. Returns None on failure."""
+    url = "https://www.atom.com/api/marketplace/domain-appraisal"
+    params = {"api_token": api_token, "user_id": user_id, "domain_name": domain}
+    vlog(f"GET {url}")
+    vlog(f"params: user_id={user_id}, domain_name={domain}, api_token={api_token[:4]}****")
+    try:
+        r = requests.get(url, params=params, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; pdt/1.0)"})
+        vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+        r.raise_for_status()
+        data = r.json()
+        vlog(f"response: {json.dumps(data)}")
+        value = data.get("atom_appraisal")
+        if value is not None:
+            vlog(f"atom_appraisal={value!r}")
+            return float(value)
+        vlog("atom_appraisal field missing from response")
+        return None
+    except requests.HTTPError as e:
+        vlog(f"HTTP error: {e} — body: {e.response.text[:200]}")
+        return None
+    except Exception as e:
+        vlog(f"exception: {e}")
+        return None
+
+
+@cli.command()
+@click.option("--atom-token", default=None, metavar="TOKEN", help="Atom API token")
+@click.option("--atom-user-id", default=None, type=int, metavar="ID", help="Atom user ID")
+@click.option("--show", is_flag=True, help="Print current config")
+def config(atom_token, atom_user_id, show):
+    """Get or set PDT configuration.
+
+    \b
+    Examples:
+      pdt config --atom-token abc123 --atom-user-id 456
+      pdt config --show
+    """
+    cfg = load_config()
+
+    if show:
+        if not cfg:
+            console.print("[dim]No config set. Use pdt config --atom-token TOKEN --atom-user-id ID[/dim]")
+            return
+        token_display = cfg.get("atom_token", "—")
+        if token_display and token_display != "—":
+            token_display = token_display[:4] + "*" * (len(token_display) - 4)
+        console.print(f"  [dim]atom_token[/dim]  : [cyan]{token_display}[/cyan]")
+        console.print(f"  [dim]atom_user_id[/dim]: [cyan]{cfg.get('atom_user_id', '—')}[/cyan]")
+        return
+
+    if atom_token is None and atom_user_id is None:
+        console.print("[yellow]Nothing to set. Pass --atom-token and/or --atom-user-id.[/yellow]")
+        return
+
+    if atom_token is not None:
+        cfg["atom_token"] = atom_token
+    if atom_user_id is not None:
+        cfg["atom_user_id"] = atom_user_id
+
+    save_config(cfg)
+    console.print(f"[green]✓ Config saved[/green] → {CONFIG_FILE}")
+
+
+@cli.command()
+@click.argument("domains", nargs=-1, metavar="[DOMAIN]...")
+@click.option("-a", "--all", "all_tracked", is_flag=True,
+              help="Appraise all tracked domains missing a value")
+@click.option("--token", envvar="ATOM_API_TOKEN", default=None, metavar="TOKEN",
+              help="Atom API token (overrides config; or set ATOM_API_TOKEN env var)")
+@click.option("--user-id", envvar="ATOM_USER_ID", default=None, type=int, metavar="ID",
+              help="Atom user ID (overrides config; or set ATOM_USER_ID env var)")
+def appraise(domains, all_tracked, token, user_id):
+    """Fetch Atom appraisals for domains missing a value.
+
+    \b
+    Skips domains that already have an appraisal. On API failure the value
+    stays as None.
+
+    \b
+    Examples:
+      pdt appraise example.com other.net --token abc --user-id 123
+      pdt appraise --all --token abc --user-id 123
+      ATOM_API_TOKEN=abc ATOM_USER_ID=123 pdt appraise --all
+    """
+    cfg = load_config()
+    token   = token   or cfg.get("atom_token")
+    user_id = user_id or cfg.get("atom_user_id")
+    vlog(f"credentials source: token={'flag/env' if token else 'missing'}, user_id={'flag/env/config' if user_id else 'missing'}")
+
+    if not token or not user_id:
+        console.print(
+            "[red]Atom credentials required.[/red] "
+            "Run [bold]pdt config --atom-token TOKEN --atom-user-id ID[/bold] "
+            "or pass --token / --user-id flags."
+        )
+        sys.exit(1)
+
+    tracked = load()
+
+    if all_tracked:
+        targets = [d["domain"] for d in tracked if not d.get("archived") and not d.get("appraisal")]
+        if not targets:
+            console.print("[dim]All tracked domains already have appraisals.[/dim]")
+            return
+    elif domains:
+        targets = [d.lower().strip() for d in domains]
+    else:
+        console.print("[red]Provide at least one domain, or use --all[/red]")
+        sys.exit(1)
+
+    changed = False
+    for name in targets:
+        entry = find_domain(tracked, name)
+        if entry and entry.get("appraisal"):
+            console.print(
+                f"  [bold cyan]{name}[/bold cyan] — already appraised at "
+                f"[green]${entry['appraisal']:,.0f}[/green], skipping"
+            )
+            continue
+
+        with console.status(f"[dim]  Appraising {name}…[/dim]"):
+            value = atom_appraise(name, token, user_id)
+
+        if value is not None:
+            result_str = f"[green]${value:,.0f}[/green]"
+        else:
+            result_str = "[dim red]no value returned[/dim red]"
+
+        console.print(f"  [bold cyan]{name}[/bold cyan] → {result_str}")
+
+        if entry and value is not None:
+            entry["appraisal"] = value
+            changed = True
+
+    if changed:
+        save(tracked)
+        console.print(f"\n[green]✓ Saved appraisals[/green]")
 
 
 # ── rdap ──────────────────────────────────────────────────────────────────────

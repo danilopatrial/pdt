@@ -35,7 +35,7 @@ pipx install .
 To pick up code changes after editing `pdt.py`:
 
 ```sh
-pipx reinstall pdt
+pipx install . --force
 ```
 
 To uninstall:
