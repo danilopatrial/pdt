@@ -27,10 +27,24 @@ DATA_FILE = DATA_DIR / "domains.json"
 PID_FILE = DATA_DIR / "daemon.pid"
 LOG_FILE = DATA_DIR / "daemon.log"
 
-NOTIFY_WINDOW = 300  # 5 minutes
+NOTIFY_WINDOW = 300        # 5 minutes
+ARCHIVE_AFTER = 24 * 3600  # 24 hours past drop time
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
+
+def archive_expired():
+    """Mark domains whose drop time passed >24h ago as archived. Returns count newly archived."""
+    domains = load()
+    newly = 0
+    for d in domains:
+        if not d.get("archived") and remaining(d) < -ARCHIVE_AFTER:
+            d["archived"] = True
+            newly += 1
+    if newly:
+        save(domains)
+    return newly
+
 
 def ensure_data():
     DATA_DIR.mkdir(exist_ok=True)
@@ -215,7 +229,7 @@ def add(domain, duration, appraisal, note, status):
 
 # ── remove ────────────────────────────────────────────────────────────────────
 
-@cli.command()
+@cli.command("rm")
 @click.argument("domain")
 def remove(domain):
     """Remove a domain from tracking."""
@@ -282,44 +296,72 @@ def update(domain, duration, appraisal, note, status):
 @click.option("--sort", default="time",
               type=click.Choice(["time", "appraisal", "domain", "status"]),
               show_default=True, help="Sort order")
-def list_domains(machine, sort):
+@click.option("-A", "--archived", "show_archived", is_flag=True,
+              help="Show archived domains (dropped >24h ago)")
+def list_domains(machine, sort, show_archived):
     """List all tracked domains."""
-    domains = load()
+    archive_expired()
+    all_domains = load()
+
+    domains = [d for d in all_domains if bool(d.get("archived")) == show_archived]
+
     if not domains:
-        console.print("[dim]No domains tracked. Use [bold]pdt add[/bold] to get started.[/dim]")
+        if show_archived:
+            console.print("[dim]No archived domains.[/dim]")
+        else:
+            console.print("[dim]No domains tracked. Use [bold]pdt add[/bold] to get started.[/dim]")
         return
 
-    key_fns = {
-        "time": lambda d: remaining(d),
-        "appraisal": lambda d: -(d.get("appraisal") or 0),
-        "domain": lambda d: d["domain"],
-        "status": lambda d: d.get("status", ""),
-    }
+    if show_archived:
+        key_fns = {
+            "time":      lambda d: remaining(d),
+            "appraisal": lambda d: -(d.get("appraisal") or 0),
+            "domain":    lambda d: d["domain"],
+            "status":    lambda d: d.get("status", ""),
+        }
+    else:
+        key_fns = {
+            "time":      lambda d: remaining(d),
+            "appraisal": lambda d: -(d.get("appraisal") or 0),
+            "domain":    lambda d: d["domain"],
+            "status":    lambda d: d.get("status", ""),
+        }
     domains = sorted(domains, key=key_fns[sort])
 
     if machine:
-        click.echo("domain,remaining_seconds,drop_time_utc,appraisal,status,note")
-        for d in domains:
-            r = int(remaining(d))
-            appr = d.get("appraisal") or ""
-            note = (d.get("note") or "").replace(",", ";")
-            click.echo(f"{d['domain']},{r},{d['drop_time']},{appr},{d['status']},{note}")
+        if show_archived:
+            click.echo("domain,dropped_seconds_ago,drop_time_utc,appraisal,status,note")
+            for d in domains:
+                ago = int(-remaining(d))
+                appr = d.get("appraisal") or ""
+                note = (d.get("note") or "").replace(",", ";")
+                click.echo(f"{d['domain']},{ago},{d['drop_time']},{appr},{d['status']},{note}")
+        else:
+            click.echo("domain,remaining_seconds,drop_time_utc,appraisal,status,note")
+            for d in domains:
+                r = int(remaining(d))
+                appr = d.get("appraisal") or ""
+                note = (d.get("note") or "").replace(",", ";")
+                click.echo(f"{d['domain']},{r},{d['drop_time']},{appr},{d['status']},{note}")
         return
 
     w = console.width
 
     # Responsive breakpoints
-    tiny  = w < 60   # show bare minimum
-    small = w < 85   # drop timestamp + note
-    mid   = w < 105  # drop note only
+    tiny  = w < 60
+    small = w < 85
+    mid   = w < 105
 
     show_index     = not tiny
     show_drop_time = not small
     show_appraisal = w >= 68
     show_note      = not mid
 
-    table_box    = box.SIMPLE_HEAD if tiny else box.ROUNDED
-    table_title  = None if tiny else "[bold white]Tracked Domains[/bold white]"
+    table_box   = box.SIMPLE_HEAD if tiny else box.ROUNDED
+    table_title = (
+        None if tiny else
+        ("[bold white]Archived Domains[/bold white]" if show_archived else "[bold white]Tracked Domains[/bold white]")
+    )
 
     table = Table(
         box=table_box,
@@ -335,48 +377,56 @@ def list_domains(machine, sort):
     if show_index:
         table.add_column("#", style="dim", width=3, justify="right", no_wrap=True)
 
-    # Domain column: fixed-ish but with a generous ceiling so it never crowds others
     domain_max = max(16, w // 3)
     table.add_column("Domain", style="bold cyan", no_wrap=True,
                      overflow="ellipsis", min_width=12, max_width=domain_max)
-    table.add_column("Drops In", justify="right", no_wrap=True, min_width=6)
 
-    if show_drop_time:
-        table.add_column("Drop Time (UTC)", justify="center", no_wrap=True, min_width=12)
+    if show_archived:
+        table.add_column("Dropped", justify="right", no_wrap=True, min_width=8)
+        if show_drop_time:
+            table.add_column("Dropped At (UTC)", justify="center", no_wrap=True, min_width=12)
+    else:
+        table.add_column("Drops In", justify="right", no_wrap=True, min_width=6)
+        if show_drop_time:
+            table.add_column("Drop Time (UTC)", justify="center", no_wrap=True, min_width=12)
+
     if show_appraisal:
         table.add_column("Appraisal", justify="right", no_wrap=True, min_width=8)
 
-    # Status: auto-sizes to content, never capped
     table.add_column("Status", no_wrap=True, overflow="ellipsis", min_width=8)
 
     if show_note:
-        # Takes all leftover space and ellipsis-truncates when tight
         table.add_column("Note", style="dim", ratio=1, overflow="ellipsis", no_wrap=True)
 
     for i, d in enumerate(domains, 1):
         rem = remaining(d)
-        rem_str = fmt_duration(rem)
-
-        if rem <= 0:
-            rem_cell = Text("AVAILABLE", style="bold green blink")
-        elif rem < NOTIFY_WINDOW:
-            rem_cell = Text(rem_str, style="bold red")
-        elif rem < 3600:
-            rem_cell = Text(rem_str, style="yellow")
-        else:
-            rem_cell = Text(rem_str, style="white")
-
-        drop_dt  = datetime.fromisoformat(d["drop_time"])
+        drop_dt = datetime.fromisoformat(d["drop_time"])
         appraisal = f"${d['appraisal']:,.0f}" if d.get("appraisal") else "—"
         st = d.get("status", "unknown")
+
+        if show_archived:
+            ago = -rem  # positive = seconds since drop
+            time_cell = Text(fmt_duration(ago) + " ago", style="dim")
+            date_str  = drop_dt.strftime("%b %d  %H:%M")
+        else:
+            rem_str = fmt_duration(rem)
+            if rem <= 0:
+                time_cell = Text("AVAILABLE", style="bold green blink")
+            elif rem < NOTIFY_WINDOW:
+                time_cell = Text(rem_str, style="bold red")
+            elif rem < 3600:
+                time_cell = Text(rem_str, style="yellow")
+            else:
+                time_cell = Text(rem_str, style="white")
+            date_str = drop_dt.strftime("%b %d  %H:%M")
 
         row = []
         if show_index:
             row.append(str(i))
         row.append(d["domain"])
-        row.append(rem_cell)
+        row.append(time_cell)
         if show_drop_time:
-            row.append(drop_dt.strftime("%b %d  %H:%M"))
+            row.append(date_str)
         if show_appraisal:
             row.append(appraisal)
         row.append(Text(st, style=status_style(st)))
@@ -387,7 +437,8 @@ def list_domains(machine, sort):
 
     console.print(table)
     total = len(domains)
-    console.print(f"[dim]  {total} domain{'s' if total != 1 else ''} · times in UTC[/dim]")
+    label = "archived domain" if show_archived else "domain"
+    console.print(f"[dim]  {total} {label}{'s' if total != 1 else ''} · times in UTC[/dim]")
 
 
 # ── next ──────────────────────────────────────────────────────────────────────
@@ -397,7 +448,8 @@ def list_domains(machine, sort):
 @click.option("-m", "--machine", is_flag=True, help="CSV output")
 def next_cmd(count, machine):
     """Show the N domains dropping soonest."""
-    domains = load()
+    archive_expired()
+    domains = [d for d in load() if not d.get("archived")]
     if not domains:
         console.print("[dim]No domains tracked.[/dim]")
         return
@@ -463,10 +515,11 @@ def rdap(domains, all_tracked):
     tracked = load()
 
     if all_tracked:
-        if not tracked:
+        active = [d for d in tracked if not d.get("archived")]
+        if not active:
             console.print("[dim]No domains tracked.[/dim]")
             return
-        targets = [d["domain"] for d in tracked]
+        targets = [d["domain"] for d in active]
     elif domains:
         targets = [d.lower().strip() for d in domains]
     else:
@@ -516,7 +569,10 @@ def poll(domains, use_next, interval):
     tracked_map = {d["domain"]: d for d in tracked_all}
 
     if use_next is not None:
-        pool = sorted(tracked_all, key=lambda d: remaining(d))[:use_next]
+        pool = sorted(
+            (d for d in tracked_all if not d.get("archived")),
+            key=lambda d: remaining(d),
+        )[:use_next]
         if not pool:
             console.print("[red]No tracked domains.[/red]")
             sys.exit(1)
@@ -633,7 +689,10 @@ def _watch_loop():
     print(f"[{ts()}] PDT watch started (PID {os.getpid()})", flush=True)
     while True:
         try:
-            domains = load()
+            newly = archive_expired()
+            if newly:
+                print(f"[{ts()}] Archived {newly} expired domain{'s' if newly != 1 else ''}", flush=True)
+            domains = [d for d in load() if not d.get("archived")]
             changed = False
             for d in domains:
                 rem = remaining(d)
