@@ -17,5 +17,5 @@ dependencies = [
 [project.scripts]
 pdt = "pdt:cli"
 
-[tool.setuptools]
-py-modules = ["pdt"]
+[tool.setuptools.packages.find]
+where = ["."]
