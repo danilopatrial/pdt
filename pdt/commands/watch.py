@@ -2,11 +2,16 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import click
 from rich import box
+from rich.live import Live
+from rich.panel import Panel
+from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 
@@ -16,13 +21,17 @@ from ..rdap import rdap_lookup
 from ..storage import archive_expired, load, save
 from ..utils import (
     console,
+    find_domain,
     fmt_duration,
+    redact_domain,
     remaining,
     resolve_targets,
     set_verbose,
+    set_vlog_sink,
     status_style,
     to_local,
     utcnow,
+    vlog,
 )
 
 
@@ -41,8 +50,6 @@ def poll(domains, use_next, interval):
       pdt poll --next 5
       pdt poll example.com -i 30
     """
-    from rich.live import Live
-
     if not domains and use_next is None:
         console.print("[red]Provide at least one domain, or use --next N[/red]")
         sys.exit(1)
@@ -174,6 +181,231 @@ def poll(domains, use_next, interval):
         console.print("\n[dim]Stopped.[/dim]")
 
 
+def _watch_domains_live(domain_names: list, tracked: list):
+    """Interactive live UI: countdown to drop, then RDAP-poll until available."""
+    POLL_INTERVAL = 5
+
+    # Validate all domains have a drop time
+    entries = {}
+    for domain in domain_names:
+        entry = find_domain(tracked, domain)
+        if entry is None:
+            console.print(
+                f"[red]Not tracked: [bold]{domain}[/bold] — "
+                f"add it first with [bold]pdt add {domain}[/bold][/red]"
+            )
+            sys.exit(1)
+        if not entry.get("drop_time"):
+            console.print(
+                f"[red]{domain} has no drop time set.[/red] "
+                f"Run: [bold]pdt update {domain} -t TIME[/bold]"
+            )
+            sys.exit(1)
+        entries[domain] = entry
+
+    states: dict = {}
+    for domain in domain_names:
+        drop_dt = datetime.fromisoformat(entries[domain]["drop_time"])
+        states[domain] = {
+            "phase":         "waiting",   # waiting | monitoring | available
+            "rdap_status":   "—",
+            "rdap_checked":  None,
+            "registrar":     entries[domain].get("registrar"),
+            "drop_dt":       drop_dt,
+            "message":       "",
+            "poll_deadline": None,
+        }
+
+    state_lock = threading.Lock()
+    stop_event = threading.Event()
+    log_buf: deque = deque(maxlen=50)
+
+    # ── Build table ────────────────────────────────────────────────────────────
+    def build_table():
+        from ..utils import VERBOSE
+        dot   = "[bright_black]·[/bright_black]"
+        total = len(domain_names)
+
+        with state_lock:
+            n_avail = sum(1 for s in states.values() if s["phase"] == "available")
+            n_monit = sum(1 for s in states.values() if s["phase"] == "monitoring")
+            n_wait  = sum(1 for s in states.values() if s["phase"] == "waiting")
+
+        parts = [
+            f"[bold white]Watch[/bold white]  {dot}  "
+            f"[bold cyan]{total} domain{'s' if total > 1 else ''}[/bold cyan]"
+        ]
+        if n_avail:
+            parts.append(f"[bold green]{n_avail} available[/bold green]")
+        if n_monit:
+            parts.append(f"[yellow]{n_monit} monitoring[/yellow]")
+        if n_wait:
+            parts.append(f"[dim]{n_wait} waiting[/dim]")
+        title = f"  {dot}  ".join(parts)
+
+        tbl = Table(
+            box=box.ROUNDED,
+            expand=True,
+            header_style="bold magenta",
+            border_style="bright_black",
+            title=title,
+            title_style="",
+            show_header=True,
+            pad_edge=True,
+        )
+        tbl.add_column("Domain",    style="cyan", no_wrap=True)
+        tbl.add_column("Phase",     no_wrap=True, min_width=15)
+        tbl.add_column("RDAP",      no_wrap=True, min_width=10)
+        tbl.add_column("Registrar", style="dim",  no_wrap=True, overflow="ellipsis", min_width=8)
+        tbl.add_column("Drop Time", no_wrap=True, min_width=22)
+        tbl.add_column("Note",      overflow="ellipsis", ratio=1)
+
+        with state_lock:
+            snapshot = {d: dict(s) for d, s in states.items()}
+
+        for domain in domain_names:
+            s  = snapshot[domain]
+            ph = s["phase"]
+
+            phase_map = {
+                "waiting":    "[dim]waiting[/dim]",
+                "monitoring": "[yellow]monitoring RDAP[/yellow]",
+                "available":  "[bold green]✓ available[/bold green]",
+            }
+            phase_cell = phase_map.get(ph, ph)
+
+            rdap_st   = s["rdap_status"]
+            rdap_cell = (
+                Text(rdap_st, style=status_style(rdap_st))
+                if rdap_st != "—"
+                else Text("—", style="dim")
+            )
+
+            drop_dt = s["drop_dt"]
+            rem     = (drop_dt - utcnow()).total_seconds()
+            drop_cell = Text(
+                to_local(drop_dt).strftime("%b %d  %H:%M:%S"),
+                style="white" if rem > 0 else "dim",
+            )
+            if rem > 0:
+                drop_cell.append(f"  in {fmt_duration(rem)}", style="dim")
+            else:
+                drop_cell.append(f"  +{fmt_duration(-rem)} past", style="dim")
+
+            note = s["message"]
+            if ph == "monitoring" and s["poll_deadline"]:
+                left = max(0.0, s["poll_deadline"] - time.monotonic())
+                note = f"next check in {int(left)}s"
+
+            reg = s.get("registrar") or "—"
+            tbl.add_row(
+                redact_domain(domain), phase_cell, rdap_cell, reg, drop_cell,
+                Text(note, style="dim"),
+            )
+
+        if not VERBOSE or not log_buf:
+            return tbl
+
+        table_lines    = 5 + len(domain_names)
+        panel_overhead = 3
+        available_h    = max(1, console.height - table_lines - panel_overhead)
+        lines    = list(log_buf)[-available_h:]
+        log_text = Text()
+        for line in lines:
+            log_text.append(f"  [v] {line}\n", style="dim blue")
+        log_panel = Panel(log_text, border_style="dim blue", padding=(0, 1))
+        return Group(tbl, log_panel)
+
+    # ── Worker ─────────────────────────────────────────────────────────────────
+    def _interruptible_sleep(secs: float) -> bool:
+        deadline = time.monotonic() + secs
+        while time.monotonic() < deadline:
+            if stop_event.is_set():
+                return False
+            time.sleep(0.2)
+        return True
+
+    def worker(domain: str):
+        s = states[domain]
+
+        # Initial RDAP lookup on first run
+        vlog(f"watch.start  {domain}  drop_time={entries[domain].get('drop_time')!r}", domain=domain)
+        initial_st, initial_reg = rdap_lookup(domain)
+        with state_lock:
+            s["rdap_status"]  = initial_st
+            s["rdap_checked"] = utcnow()
+            if initial_reg is not None:
+                s["registrar"] = initial_reg
+        vlog(f"watch.rdap_initial  {domain}  status={initial_st!r}  registrar={initial_reg!r}", domain=domain)
+
+        # Phase 1: sleep until drop time
+        sleep_secs = (s["drop_dt"] - utcnow()).total_seconds()
+        if sleep_secs > 0:
+            vlog(f"watch.sleeping  {domain}  secs={sleep_secs:.0f}", domain=domain)
+            if not _interruptible_sleep(sleep_secs):
+                return
+
+        # Notify: drop time elapsed
+        send_notification(
+            f"Drop time elapsed: {domain}",
+            "Monitoring RDAP for availability…",
+        )
+        with state_lock:
+            s["phase"]   = "monitoring"
+            s["message"] = "drop time elapsed"
+        vlog(f"watch.monitoring  {domain}  drop time elapsed", domain=domain)
+
+        # Phase 2: poll RDAP until available
+        while not stop_event.is_set():
+            new_st, new_reg = rdap_lookup(domain)
+            with state_lock:
+                prev_st = s["rdap_status"]
+                s["rdap_status"]  = new_st
+                s["rdap_checked"] = utcnow()
+                if new_reg:
+                    s["registrar"] = new_reg
+                s["message"] = ""
+            if new_st != prev_st:
+                vlog(f"watch.rdap_change  {domain}  {prev_st!r} → {new_st!r}", domain=domain)
+
+            if "available" in new_st.lower():
+                with state_lock:
+                    s["phase"]   = "available"
+                    s["message"] = "RDAP confirmed available"
+                vlog(f"watch.available  {domain}", domain=domain)
+                send_notification(f"✓ {domain} is available!", f"RDAP: {new_st}")
+                return
+
+            with state_lock:
+                s["poll_deadline"] = time.monotonic() + POLL_INTERVAL
+            if not _interruptible_sleep(POLL_INTERVAL):
+                return
+
+    # ── Launch ─────────────────────────────────────────────────────────────────
+    threads = [
+        threading.Thread(target=worker, args=(d,), daemon=True)
+        for d in domain_names
+    ]
+
+    console.print("[dim]Watching… [bold]Ctrl+C[/bold] to abort.[/dim]")
+    set_vlog_sink(log_buf)
+    try:
+        with Live(build_table(), refresh_per_second=8, screen=False) as live:
+            for t in threads:
+                t.start()
+            while any(t.is_alive() for t in threads):
+                live.update(build_table())
+                time.sleep(0.12)
+            live.update(build_table())
+    except KeyboardInterrupt:
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=2.0)
+        console.print("\n[dim]Stopped.[/dim]")
+    finally:
+        set_vlog_sink(None)
+
+
 def _watch_loop():
     def ts():
         return utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -191,6 +423,8 @@ def _watch_loop():
             changed = False
             for d in domains:
                 rem = remaining(d)
+
+                # Notify 5 min before drop
                 if 0 < rem <= NOTIFY_WINDOW and not d.get("notified"):
                     title = f"Domain dropping: {d['domain']}"
                     lines = [f"Available in {fmt_duration(rem)}"]
@@ -205,6 +439,22 @@ def _watch_loop():
                         f"[{ts()}] Notified: {d['domain']} drops in {fmt_duration(rem)}",
                         flush=True,
                     )
+
+                # Notify once when RDAP shows available after drop
+                if rem <= 0 and not d.get("rdap_notified"):
+                    rdap_st, _ = rdap_lookup(d["domain"])
+                    if "available" in rdap_st.lower():
+                        send_notification(
+                            f"✓ {d['domain']} is available!",
+                            f"RDAP: {rdap_st}",
+                        )
+                        d["rdap_notified"] = True
+                        changed = True
+                        print(
+                            f"[{ts()}] RDAP available: {d['domain']} ({rdap_st})",
+                            flush=True,
+                        )
+
             if changed:
                 save(domains)
         except Exception as e:
@@ -213,17 +463,42 @@ def _watch_loop():
 
 
 @click.command("watch")
+@click.argument("domains", nargs=-1, required=False)
 @click.option("-d", "--detach", is_flag=True, help="Run as background daemon")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show detailed output (same as pdt -v watch)")
-def watch(detach, verbose):
-    """Watch for dropping domains and notify 5 min before they drop.
+def watch(domains, detach, verbose):
+    """Watch for dropping domains and notify when they drop and become available.
 
-    Use --detach / -d to run in the background.
-    Stop with: pdt stop
+    With no arguments, runs (or detaches) a background daemon that notifies
+    5 minutes before each tracked domain drops, and again once RDAP confirms
+    it is available.
+
+    With DOMAIN arguments, opens an interactive live display that counts down
+    to each domain's drop time, notifies when the timer elapses, then polls
+    RDAP every 5 seconds and notifies again once the domain becomes available.
+
+    \b
+    DOMAIN can be a domain name or a 1-based index from 'pdt list'.
+
+    \b
+    Examples:
+      pdt watch                      # start daemon (foreground)
+      pdt watch -d                   # start daemon in background
+      pdt watch example.com          # interactive watch for one domain
+      pdt watch 1 3 example.net      # interactive watch for multiple domains
     """
     if verbose:
         set_verbose(True)
+
+    if domains:
+        # Interactive live watch mode for specific domains
+        tracked = load()
+        domain_names = resolve_targets(domains, tracked)
+        _watch_domains_live(domain_names, tracked)
+        return
+
+    # ── Daemon mode (no domain args) ──────────────────────────────────────────
     if detach:
         if PID_FILE.exists():
             try:

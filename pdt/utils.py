@@ -20,19 +20,48 @@ def set_verbose(v: bool):
     VERBOSE = v
 
 
+# ── Redaction ─────────────────────────────────────────────────────────────────
+
+REDACTED = False
+
+
+def set_redacted(v: bool):
+    global REDACTED
+    REDACTED = v
+
+
+def redact_domain(name: str) -> str:
+    """Replace the SLD with █ characters, preserving the TLD."""
+    if not REDACTED:
+        return name
+    parts = name.rsplit(".", 1)
+    if len(parts) == 2:
+        return "█" * len(parts[0]) + "." + parts[1]
+    return "█" * len(name)
+
+
 def set_vlog_sink(sink):
     global _vlog_sink
     _vlog_sink = sink
 
 
-def vlog(msg: str):
-    """Log a verbose message. Buffered when inside a Live display, printed directly otherwise."""
+def vlog(msg: str, *, domain: str | None = None):
+    """Log a verbose message. Buffered when inside a Live display, printed directly otherwise.
+
+    If *domain* is given the raw message is written to the file logger (unredacted) and
+    any occurrence of the domain name in the display string is replaced with the redacted form.
+    """
     if not VERBOSE:
         return
+    # Always write the unredacted message to the persistent log file.
+    from .logger import get_logger  # lazy to avoid circular import at module load
+    get_logger().debug(f"vlog  {msg}")
+    # Redact for on-screen display when a domain is supplied.
+    display = msg.replace(domain, redact_domain(domain)) if domain else msg
     if _vlog_sink is not None:
-        _vlog_sink.append(msg)
+        _vlog_sink.append(display)
     else:
-        console.print(f"[dim blue]  [v] {msg}[/dim blue]")
+        console.print(f"[dim blue]  [v] {display}[/dim blue]")
 
 
 # ── Time helpers ──────────────────────────────────────────────────────────────

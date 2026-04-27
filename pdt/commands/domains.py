@@ -6,6 +6,7 @@ from rich import box
 from rich.text import Text
 
 from ..constants import NOTIFY_WINDOW
+from ..logger import log_event
 from ..rdap import rdap_lookup
 from ..storage import archive_expired, load, save
 from ..utils import (
@@ -13,6 +14,7 @@ from ..utils import (
     find_domain,
     fmt_duration,
     parse_duration,
+    redact_domain,
     remaining,
     resolve_targets,
     status_style,
@@ -58,7 +60,7 @@ def add(domains, duration, appraisal, note, status):
             continue
 
         if any(d["domain"] == domain for d in tracked):
-            console.print(f"[yellow]Already tracking [bold]{domain}[/bold][/yellow]")
+            console.print(f"[yellow]Already tracking [bold]{redact_domain(domain)}[/bold][/yellow]")
             continue
 
         reg = None
@@ -81,9 +83,10 @@ def add(domains, duration, appraisal, note, status):
         st_style  = status_style(st)
         drop_info = f"— drops in [white]{fmt_duration(secs)}[/white] " if secs is not None else ""
         console.print(
-            f"[green]✓ Added[/green] [bold cyan]{domain}[/bold cyan] "
+            f"[green]✓ Added[/green] [bold cyan]{redact_domain(domain)}[/bold cyan] "
             f"{drop_info}— status: [{st_style}]{st}[/{st_style}]"
         )
+        log_event(f"domain.add  {domain}  status={st!r}  drop_time={drop_time!r}")
 
     save(tracked)
 
@@ -97,7 +100,8 @@ def remove(targets):
     new = [d for d in domains if d["domain"] not in names]
     save(new)
     for name in names:
-        console.print(f"[green]✓ Removed[/green] [bold]{name}[/bold]")
+        console.print(f"[green]✓ Removed[/green] [bold]{redact_domain(name)}[/bold]")
+        log_event(f"domain.remove  {name}")
 
 
 @click.command("flag")
@@ -110,7 +114,8 @@ def flag(targets):
         entry = find_domain(tracked, name)
         entry["flagged"] = not entry.get("flagged", False)
         state = "[yellow]⚑ flagged[/yellow]" if entry["flagged"] else "[dim]unflagged[/dim]"
-        console.print(f"[bold cyan]{name}[/bold cyan] → {state}")
+        console.print(f"[bold cyan]{redact_domain(name)}[/bold cyan] → {state}")
+        log_event(f"domain.flag  {name}  flagged={entry['flagged']}")
     save(tracked)
 
 
@@ -164,8 +169,14 @@ def update(targets, duration, appraisal, note, status):
             entry["status"] = status
             changes.append(f"status → [{status_style(status)}]{status}[/{status_style(status)}]")
         console.print(
-            f"[green]✓ Updated[/green] [bold cyan]{name}[/bold cyan] — " + ", ".join(changes)
+            f"[green]✓ Updated[/green] [bold cyan]{redact_domain(name)}[/bold cyan] — " + ", ".join(changes)
         )
+        log_event(f"domain.update  {name}  " + "  ".join(
+            f"{k}={v!r}" for k, v in [
+                ("drop_time", drop_time), ("appraisal", appraisal),
+                ("note", note), ("status", status),
+            ] if v is not None
+        ))
 
     save(domains)
 
@@ -196,7 +207,7 @@ def list_domains(machine, sort, show_archived, show_backorders):
                 taken_by  = (b.get("taken_by")  or "").replace(",", ";")
                 reason    = (b.get("reason")    or "").replace(",", ";")
                 click.echo(
-                    f"{b['domain']},{b['result']},{b.get('attempts', '')},"
+                    f"{redact_domain(b['domain'])},{b['result']},{b.get('attempts', '')},"
                     f"{b['backordered_at']},{registrar},{taken_by},{reason}"
                 )
             return
@@ -236,7 +247,7 @@ def list_domains(machine, sort, show_archived, show_backorders):
                 note      = (d.get("note")      or "").replace(",", ";")
                 reg       = (d.get("registrar") or "").replace(",", ";")
                 drop_str  = d.get("drop_time") or ""
-                click.echo(f"{d['domain']},{ago},{drop_str},{appr},{d['status']},{reg},{note}")
+                click.echo(f"{redact_domain(d['domain'])},{ago},{drop_str},{appr},{d['status']},{reg},{note}")
         else:
             click.echo("domain,remaining_seconds,drop_time_utc,appraisal,status,registrar,note")
             for d in domains:
@@ -245,7 +256,7 @@ def list_domains(machine, sort, show_archived, show_backorders):
                 note     = (d.get("note")      or "").replace(",", ";")
                 reg      = (d.get("registrar") or "").replace(",", ";")
                 drop_str = d.get("drop_time") or ""
-                click.echo(f"{d['domain']},{r},{drop_str},{appr},{d['status']},{reg},{note}")
+                click.echo(f"{redact_domain(d['domain'])},{r},{drop_str},{appr},{d['status']},{reg},{note}")
         return
 
     w = console.width
@@ -308,7 +319,7 @@ def _build_backorders_table(bos):
             ts = to_local(dt).strftime("%b %d  %H:%M:%S")
         except Exception:
             pass
-        tbl.add_row(b["domain"], result_cell, str(b.get("attempts", "—")), ts, detail)
+        tbl.add_row(redact_domain(b["domain"]), result_cell, str(b.get("attempts", "—")), ts, detail)
     return tbl
 
 
@@ -384,7 +395,7 @@ def _build_domain_table(
 
         flagged     = d.get("flagged", False)
         domain_cell = Text(
-            ("⚑ " if flagged else "") + d["domain"],
+            ("⚑ " if flagged else "") + redact_domain(d["domain"]),
             style="bold yellow" if flagged else "bold cyan",
         )
 
@@ -427,7 +438,7 @@ def next_cmd(count, machine):
         for d in domains:
             drop_str = d.get("drop_time") or ""
             click.echo(
-                f"{d['domain']},{int(remaining(d))},{drop_str},"
+                f"{redact_domain(d['domain'])},{int(remaining(d))},{drop_str},"
                 f"{d.get('appraisal', '')},{d['status']}"
             )
         return
@@ -452,7 +463,7 @@ def next_cmd(count, machine):
         st      = d.get("status", "unknown")
 
         parts = [
-            f"  [dim]{i}.[/dim] [bold cyan]{d['domain']}[/bold cyan]",
+            f"  [dim]{i}.[/dim] [bold cyan]{redact_domain(d['domain'])}[/bold cyan]",
             f"[white]{rem_str}[/white]",
         ]
         if show_appraisal:

@@ -4,8 +4,9 @@ import click
 
 from ..spaceship import atom_appraise
 from ..rdap import rdap_lookup
+from ..logger import log_event
 from ..storage import load, save
-from ..utils import console, find_domain, resolve_targets, status_style
+from ..utils import console, find_domain, redact_domain, resolve_targets, status_style
 from ..config import load_config
 
 
@@ -60,12 +61,12 @@ def appraise(domains, all_tracked, token, user_id):
         entry = find_domain(tracked, name)
         if entry and entry.get("appraisal"):
             console.print(
-                f"  [bold cyan]{name}[/bold cyan] — already appraised at "
+                f"  [bold cyan]{redact_domain(name)}[/bold cyan] — already appraised at "
                 f"[green]${entry['appraisal']:,.0f}[/green], skipping"
             )
             continue
 
-        with console.status(f"[dim]  Appraising {name}…[/dim]"):
+        with console.status(f"[dim]  Appraising {redact_domain(name)}…[/dim]"):
             value = atom_appraise(name, token, user_id)
 
         result_str = (
@@ -73,11 +74,15 @@ def appraise(domains, all_tracked, token, user_id):
             if value is not None
             else "[dim red]no value returned[/dim red]"
         )
-        console.print(f"  [bold cyan]{name}[/bold cyan] → {result_str}")
+        console.print(f"  [bold cyan]{redact_domain(name)}[/bold cyan] → {result_str}")
 
         if entry and value is not None:
             entry["appraisal"] = value
             changed = True
+        log_event(
+            f"appraise  {name}  value={value}"
+            if value is not None else f"appraise  {name}  value=None (no result)"
+        )
 
     if changed:
         save(tracked)
@@ -88,7 +93,9 @@ def appraise(domains, all_tracked, token, user_id):
 @click.argument("domains", nargs=-1, metavar="[DOMAIN]...")
 @click.option("-a", "--all", "all_tracked", is_flag=True,
               help="Fetch status for all tracked domains")
-def rdap(domains, all_tracked):
+@click.option("--archived", "archived", is_flag=True,
+              help="Fetch status for all archived domains")
+def rdap(domains, all_tracked, archived):
     """Fetch and update RDAP status.
 
     \b
@@ -96,10 +103,17 @@ def rdap(domains, all_tracked):
       pdt rdap example.com
       pdt rdap example.com other.net
       pdt rdap --all
+      pdt rdap --archived
     """
     tracked = load()
 
-    if all_tracked:
+    if archived:
+        pool = [d for d in tracked if d.get("archived")]
+        if not pool:
+            console.print("[dim]No archived domains.[/dim]")
+            return
+        targets = [d["domain"] for d in pool]
+    elif all_tracked:
         active = [d for d in tracked if not d.get("archived")]
         if not active:
             console.print("[dim]No domains tracked.[/dim]")
@@ -113,17 +127,18 @@ def rdap(domains, all_tracked):
 
     changed = False
     for name in targets:
-        with console.status(f"[dim]  {name}…[/dim]"):
+        with console.status(f"[dim]  {redact_domain(name)}…[/dim]"):
             status, registrar = rdap_lookup(name)
         entry      = find_domain(tracked, name)
         untracked  = "" if entry else " [dim](not tracked)[/dim]"
         st         = status_style(status)
         reg_str    = f"  [dim]({registrar})[/dim]" if registrar else ""
-        console.print(f"  [bold cyan]{name}[/bold cyan]{untracked} → [{st}]{status}[/{st}]{reg_str}")
+        console.print(f"  [bold cyan]{redact_domain(name)}[/bold cyan]{untracked} → [{st}]{status}[/{st}]{reg_str}")
         if entry:
             entry["status"]    = status
             entry["registrar"] = registrar
             changed = True
+        log_event(f"rdap  {name}  status={status!r}  registrar={registrar!r}")
 
     if changed:
         save(tracked)

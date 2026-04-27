@@ -6,6 +6,7 @@ import time
 import requests
 
 from .config import save_config
+from .logger import log_api_error, log_api_req, log_api_resp
 from .utils import console, vlog
 
 
@@ -47,10 +48,15 @@ def atom_appraise(domain: str, api_token: str, user_id: int) -> float | None:
     params = {"api_token": api_token, "user_id": user_id, "domain_name": domain}
     vlog(f"GET {url}")
     vlog(f"params: user_id={user_id}, domain_name={domain}, api_token={api_token[:4]}****")
+    log_api_req("GET", url)
+    t0 = time.monotonic()
     try:
         r = requests.get(url, params=params, timeout=15,
                          headers={"User-Agent": "Mozilla/5.0 (compatible; pdt/1.0)"})
+        elapsed = (time.monotonic() - t0) * 1000
         vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+        log_api_resp("GET", url, r.status_code, len(r.content), elapsed,
+                     body_excerpt=r.text[:200])
         r.raise_for_status()
         data = r.json()
         vlog(f"response: {r.text[:200]}")
@@ -61,10 +67,14 @@ def atom_appraise(domain: str, api_token: str, user_id: int) -> float | None:
         vlog("atom_appraisal field missing from response")
         return None
     except requests.HTTPError as e:
+        elapsed = (time.monotonic() - t0) * 1000
         vlog(f"HTTP error: {e} — body: {e.response.text[:200]}")
+        log_api_resp("GET", url, e.response.status_code, len(e.response.content), elapsed,
+                     error=str(e))
         return None
     except Exception as e:
         vlog(f"exception: {e}")
+        log_api_error("GET", url, e)
         return None
 
 
@@ -148,8 +158,12 @@ def spaceship_ensure_contact(cfg: dict, api_key: str, api_secret: str) -> str:
         "Content-Type": "application/json",
     }
     vlog(f"PUT {url}")
+    log_api_req("PUT", url, body={k: v for k, v in body.items() if k != "email"})
+    t0 = time.monotonic()
     r = requests.put(url, headers=headers, json=body, timeout=30)
+    elapsed = (time.monotonic() - t0) * 1000
     vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+    log_api_resp("PUT", url, r.status_code, len(r.content), elapsed)
     if not r.ok:
         console.print(f"[red]Contact creation failed ({r.status_code}):[/red] {r.text}")
         sys.exit(1)
@@ -190,9 +204,13 @@ def spaceship_register(domain: str, api_key: str, api_secret: str, contact_id: s
         },
     }
     vlog(f"POST {url}")
+    log_api_req("POST", url, body={k: v for k, v in body.items() if k != "contacts"})
+    t0 = time.monotonic()
     try:
         r = requests.post(url, headers=headers, json=body, timeout=30)
+        elapsed = (time.monotonic() - t0) * 1000
         vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+        log_api_resp("POST", url, r.status_code, len(r.content), elapsed)
         if r.status_code == 202:
             op_id = r.headers.get("spaceship-async-operationid")
             return op_id, None, False
@@ -208,6 +226,7 @@ def spaceship_register(domain: str, api_key: str, api_secret: str, contact_id: s
         return None, f"HTTP {r.status_code}: {r.text[:200]}", fatal
     except Exception as e:
         vlog(f"register exception: {e}")
+        log_api_error("POST", url, e)
         return None, str(e), False
 
 
@@ -216,13 +235,18 @@ def spaceship_poll_async(operation_id: str, api_key: str, api_secret: str):
     url = f"https://spaceship.dev/api/v1/async-operations/{operation_id}"
     headers = {"X-API-Key": api_key, "X-API-Secret": api_secret}
     vlog(f"GET {url}")
+    log_api_req("GET", url)
+    t0 = time.monotonic()
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        elapsed = (time.monotonic() - t0) * 1000
         vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+        log_api_resp("GET", url, r.status_code, len(r.content), elapsed)
         r.raise_for_status()
         return r.json().get("status")
     except Exception as e:
         vlog(f"async poll exception: {e}")
+        log_api_error("GET", url, e)
         return None
 
 
@@ -241,9 +265,13 @@ def spaceship_check_available(domain: str, api_key: str, api_secret: str) -> tup
         "X-API-Secret": api_secret,
     }
     vlog(f"GET {url}")
+    log_api_req("GET", url)
+    t0 = time.monotonic()
     try:
         r = requests.get(url, headers=headers, timeout=15)
+        elapsed = (time.monotonic() - t0) * 1000
         vlog(f"HTTP {r.status_code} ({len(r.content)} bytes)")
+        log_api_resp("GET", url, r.status_code, len(r.content), elapsed)
         if not r.ok:
             return False, f"http-{r.status_code}", False
         data       = r.json()
@@ -254,4 +282,5 @@ def spaceship_check_available(domain: str, api_key: str, api_secret: str) -> tup
         return False, result, is_premium
     except Exception as e:
         vlog(f"availability check exception: {e}")
+        log_api_error("GET", url, e)
         return False, "check-error", False

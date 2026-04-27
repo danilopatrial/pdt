@@ -16,6 +16,7 @@ from rich.text import Text
 
 from ..config import load_config
 from ..constants import BACKORDER_LOG_FILE, BACKORDER_PID_FILE, NOTIFY_WINDOW
+from ..logger import log_event
 from ..notifications import send_notification
 from ..rdap import rdap_lookup
 from ..spaceship import (
@@ -30,6 +31,7 @@ from ..utils import (
     console,
     find_domain,
     fmt_duration,
+    redact_domain,
     remaining,
     resolve_targets,
     set_verbose,
@@ -309,7 +311,7 @@ def backorder(domains, verbose, detach, daemon):
                     note += f"  ·  op:{s['op_id'][:8]}…  [{op_label}]"
 
             reg = s.get("registrar") or "—"
-            tbl.add_row(domain, phase_cell, rdap_cell, reg, drop_cell,
+            tbl.add_row(redact_domain(domain), phase_cell, rdap_cell, reg, drop_cell,
                         Text(note, style="dim"))
 
         if not VERBOSE or not log_buf:
@@ -338,12 +340,14 @@ def backorder(domains, verbose, detach, daemon):
     def worker(domain: str):
         s = states[domain]
 
+        log_event(f"backorder.start  {domain}  drop_time={entries[domain].get('drop_time')!r}")
         initial_st, initial_reg = rdap_lookup(domain)
         with state_lock:
             s["rdap_status"]  = initial_st
             s["rdap_checked"] = utcnow()
             if initial_reg is not None:
                 s["registrar"] = initial_reg
+        log_event(f"backorder.rdap_initial  {domain}  status={initial_st!r}  registrar={initial_reg!r}")
 
         if initial_st != "available":
             sleep_secs = (
@@ -385,12 +389,18 @@ def backorder(domains, verbose, detach, daemon):
                         s["registrar"] = new_reg
 
                 if new_st == "available":
+                    log_event(f"backorder.rdap_available  {domain}")
                     is_available = True
                     break
 
                 if (prev_st not in _transient
                         and new_st not in _transient
                         and new_st != prev_st):
+                    log_event(
+                        f"backorder.rdap_status_change  {domain}  "
+                        f"{prev_st!r} → {new_st!r}  (aborting)",
+                        level="warning",
+                    )
                     with state_lock:
                         s["phase"]   = "failed"
                         s["message"] = f"rdap changed: '{prev_st}' → '{new_st}'"
@@ -441,6 +451,10 @@ def backorder(domains, verbose, detach, daemon):
 
             op_id, err, fatal = spaceship_register(domain, api_key, api_secret, contact_id)
             if err:
+                log_event(
+                    f"backorder.register_error  {domain}  attempt={attempt}  fatal={fatal}  {err}",
+                    level="warning",
+                )
                 with state_lock:
                     s["message"] = f"attempt {attempt} error: {err}"
                 if fatal:
@@ -513,6 +527,9 @@ def backorder(domains, verbose, detach, daemon):
 
             if op_result == "success":
                 success = True
+                log_event(
+                    f"backorder.registered  {domain}  attempt={attempt}/{MAX_ATTEMPTS}"
+                )
                 with state_lock:
                     s["phase"]   = "success"
                     s["message"] = f"registered on attempt {attempt}/{MAX_ATTEMPTS}"
@@ -546,6 +563,10 @@ def backorder(domains, verbose, detach, daemon):
                     s["phase"]   = "failed"
                     s["message"] = f"all {MAX_ATTEMPTS} attempts exhausted"
             if s["phase"] == "failed":
+                log_event(
+                    f"backorder.failed  {domain}  all {MAX_ATTEMPTS} attempts exhausted",
+                    level="warning",
+                )
                 final_st, final_reg = rdap_lookup(domain)
                 if final_st != "available" and final_reg:
                     with state_lock:
@@ -677,12 +698,12 @@ def register_domain(domain):
     avail, avail_result, _ = spaceship_check_available(domain, api_key, api_secret)
     if not avail:
         console.print(
-            f"[red]Domain [cyan]{domain}[/cyan] is not available for registration:[/red] {avail_result}"
+            f"[red]Domain [cyan]{redact_domain(domain)}[/cyan] is not available for registration:[/red] {avail_result}"
         )
         sys.exit(1)
 
     MAX_ATTEMPTS = 15
-    console.print(f"[bold]Registering[/bold] [cyan]{domain}[/cyan]…")
+    console.print(f"[bold]Registering[/bold] [cyan]{redact_domain(domain)}[/cyan]…")
     op_id = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         op_id, err, fatal = spaceship_register(domain, api_key, api_secret, contact_id)
@@ -722,7 +743,7 @@ def register_domain(domain):
         time.sleep(ASYNC_INTERVAL)
 
     if result == "success":
-        console.print(f"[bold green]Registered[/bold green] [cyan]{domain}[/cyan] successfully.")
+        console.print(f"[bold green]Registered[/bold green] [cyan]{redact_domain(domain)}[/cyan] successfully.")
         bos = load_backorders()
         bos.append({
             "domain":         domain,
@@ -738,7 +759,7 @@ def register_domain(domain):
             entry["status"] = "registered"
             save(tracked)
     elif result == "failed":
-        console.print(f"[red]Registration operation failed for[/red] [cyan]{domain}[/cyan].")
+        console.print(f"[red]Registration operation failed for[/red] [cyan]{redact_domain(domain)}[/cyan].")
         sys.exit(1)
     else:
         console.print(
@@ -849,18 +870,19 @@ def available(targets, machine):
         is_avail, result, is_premium = spaceship_check_available(domain, api_key, api_secret)
 
         if machine:
-            print(f"{domain},{result},{str(is_premium).lower()}")
+            print(f"{redact_domain(domain)},{result},{str(is_premium).lower()}")
         else:
+            display = redact_domain(domain)
             premium_suffix = "  [dim](premium)[/dim]" if is_premium else ""
             if is_avail:
                 console.print(
-                    f"[bold green]✓[/bold green]  {domain:<30} [bold green]available[/bold green]{premium_suffix}"
+                    f"[bold green]✓[/bold green]  {display:<30} [bold green]available[/bold green]{premium_suffix}"
                 )
             elif result == "check-error" or result.startswith("http-"):
                 console.print(
-                    f"[dim red]?[/dim red]  {domain:<30} [dim red]{result}[/dim red]{premium_suffix}"
+                    f"[dim red]?[/dim red]  {display:<30} [dim red]{result}[/dim red]{premium_suffix}"
                 )
             else:
                 console.print(
-                    f"[bold red]✗[/bold red]  {domain:<30} [bold red]{result}[/bold red]{premium_suffix}"
+                    f"[bold red]✗[/bold red]  {display:<30} [bold red]{result}[/bold red]{premium_suffix}"
                 )

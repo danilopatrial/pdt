@@ -3,6 +3,7 @@ from pathlib import Path
 VERSION = "1.0.0"
 
 DATA_DIR        = Path.home() / ".pdt"
+LOGS_DIR        = DATA_DIR / "logs"
 DATA_FILE       = DATA_DIR / "domains.json"
 CONFIG_FILE     = DATA_DIR / "config.json"
 PID_FILE             = DATA_DIR / "daemon.pid"

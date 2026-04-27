@@ -1,20 +1,31 @@
+import sys
+
 import click
 
 from ..constants import VERSION
-from ..utils import set_verbose
+from ..logger import get_logger
+from ..utils import set_verbose, set_redacted
 
 
 @click.group()
 @click.version_option(VERSION, prog_name="pdt")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show detailed output including API requests and responses.")
-def cli(verbose):
+@click.option("-R", "--redacted", is_flag=True, default=False,
+              help="Redact domain names in output (for screenshots).")
+@click.pass_context
+def cli(ctx, verbose, redacted):
     """PDT — Pending Delete Domain Tracker
 
     Track domains in pending-delete and get desktop notifications
     5 minutes before they become available.
     """
     set_verbose(verbose)
+    set_redacted(redacted)
+    # Log every invocation (skip --version which exits before subcommand)
+    if ctx.invoked_subcommand:
+        argv = " ".join(sys.argv[1:])
+        get_logger().info(f"INVOKE  pdt {argv}")
 
 
 # Register all commands
