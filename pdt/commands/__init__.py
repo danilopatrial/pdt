@@ -29,7 +29,7 @@ def cli(ctx, verbose, redacted):
 
 
 # Register all commands
-from .domains import add, flag, list_domains, next_cmd, remove, update
+from .domains import add, copy_domain, flag, list_domains, next_cmd, remove, update
 from .appraise import appraise, rdap
 from .watch import logs, poll, status, stop, watch
 from .backorder import available, backorder, backorder_logs, backorder_stop, register_domain
@@ -41,6 +41,7 @@ cli.add_command(flag)
 cli.add_command(update)
 cli.add_command(list_domains,    name="list")
 cli.add_command(next_cmd,        name="next")
+cli.add_command(copy_domain,     name="copy")
 cli.add_command(appraise)
 cli.add_command(rdap)
 cli.add_command(poll)

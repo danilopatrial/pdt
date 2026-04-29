@@ -95,7 +95,13 @@ def appraise(domains, all_tracked, token, user_id):
               help="Fetch status for all tracked domains")
 @click.option("--archived", "archived", is_flag=True,
               help="Fetch status for all archived domains")
-def rdap(domains, all_tracked, archived):
+@click.option("--missing", "only_missing", is_flag=True,
+              help="Only domains with no status, a fetch error, or a 429 rate-limit error")
+@click.option("--redemption", "only_redemption", is_flag=True,
+              help="Only domains currently in redemption period")
+@click.option("--available", "only_available", is_flag=True,
+              help="Only domains whose stored status is available")
+def rdap(domains, all_tracked, archived, only_missing, only_redemption, only_available):
     """Fetch and update RDAP status.
 
     \b
@@ -103,6 +109,9 @@ def rdap(domains, all_tracked, archived):
       pdt rdap example.com
       pdt rdap example.com other.net
       pdt rdap --all
+      pdt rdap --all --missing
+      pdt rdap --all --redemption
+      pdt rdap --all --available
       pdt rdap --archived
     """
     tracked = load()
@@ -124,6 +133,21 @@ def rdap(domains, all_tracked, archived):
     else:
         console.print("[red]Provide at least one domain, or use --all[/red]")
         sys.exit(1)
+
+    if only_missing or only_redemption or only_available:
+        def _match(name):
+            entry = find_domain(tracked, name)
+            st = (entry.get("status") or "").lower() if entry else ""
+            if only_missing:
+                return not st or "error" in st or "429" in st or "fetch" in st or "timeout" in st
+            if only_redemption:
+                return "redemption" in st
+            if only_available:
+                return "available" in st
+        targets = [t for t in targets if _match(t)]
+        if not targets:
+            console.print("[dim]No domains match that filter.[/dim]")
+            return
 
     changed = False
     for name in targets:

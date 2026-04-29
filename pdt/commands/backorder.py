@@ -18,7 +18,7 @@ from ..config import load_config
 from ..constants import BACKORDER_LOG_FILE, BACKORDER_PID_FILE, NOTIFY_WINDOW
 from ..logger import log_event
 from ..notifications import send_notification
-from ..rdap import rdap_lookup
+from ..rdap import RdapThrottle, rdap_lookup
 from ..spaceship import (
     RateLimiter,
     spaceship_check_available,
@@ -44,13 +44,15 @@ from ..utils import (
 
 
 @click.command("backorder")
-@click.argument("domains", nargs=-1, required=True)
+@click.argument("domains", nargs=-1, required=False)
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show detailed output (same as pdt -v backorder)")
 @click.option("-d", "--detach", is_flag=True, help="Run as background daemon")
 @click.option("--daemon", is_flag=True, hidden=True,
               help="Internal: run as daemon process (used by --detach)")
-def backorder(domains, verbose, detach, daemon):
+@click.option("-n", "--next", "use_next", type=int, default=None, metavar="N",
+              help="Backorder the next N soonest-dropping tracked domains")
+def backorder(domains, verbose, detach, daemon, use_next):
     """Snipe one or more domains the moment they become available via Spaceship.
 
     \b
@@ -63,6 +65,20 @@ def backorder(domains, verbose, detach, daemon):
     """
     if verbose:
         set_verbose(True)
+
+    if use_next is not None:
+        tracked_all = load()
+        pool = sorted(
+            (d for d in tracked_all if not d.get("archived") and d.get("drop_time")),
+            key=lambda d: (d.get("drop_time"), d["domain"]),
+        )[:use_next]
+        if not pool:
+            console.print("[red]No tracked domains with drop times.[/red]")
+            sys.exit(1)
+        domains = tuple(d["domain"] for d in pool)
+    elif not domains:
+        console.print("[red]Provide at least one domain, or use --next N[/red]")
+        sys.exit(1)
 
     # ── 0. Detach: spawn a background daemon ─────────────────────────────────
     if detach:
@@ -216,8 +232,9 @@ def backorder(domains, verbose, detach, daemon):
             "message":        "",
         }
 
-    state_lock = threading.Lock()
-    stop_event = threading.Event()
+    state_lock    = threading.Lock()
+    stop_event    = threading.Event()
+    rdap_throttle = RdapThrottle(len(domains))
 
     # ── 6. Build table ─────────────────────────────────────────────────────────
     def build_table():
@@ -341,6 +358,10 @@ def backorder(domains, verbose, detach, daemon):
         s = states[domain]
 
         log_event(f"backorder.start  {domain}  drop_time={entries[domain].get('drop_time')!r}")
+        if not rdap_throttle.acquire(stop_event):
+            with state_lock:
+                s["phase"] = "stopped"
+            return
         initial_st, initial_reg = rdap_lookup(domain)
         with state_lock:
             s["rdap_status"]  = initial_st
@@ -379,6 +400,10 @@ def backorder(domains, verbose, detach, daemon):
                         s["message"] = "1 h past drop — may have been renewed"
                     return
 
+                if not rdap_throttle.acquire(stop_event):
+                    with state_lock:
+                        s["phase"] = "stopped"
+                    return
                 new_st, new_reg = rdap_lookup(domain)
                 _transient = {"fetch-error", "timeout", "fetching…", "—"}
                 with state_lock:
@@ -458,6 +483,7 @@ def backorder(domains, verbose, detach, daemon):
                 with state_lock:
                     s["message"] = f"attempt {attempt} error: {err}"
                 if fatal:
+                    rdap_throttle.acquire(stop_event)
                     rdap_st, _ = rdap_lookup(domain)
                     if rdap_st != "available":
                         with state_lock:
@@ -567,6 +593,7 @@ def backorder(domains, verbose, detach, daemon):
                     f"backorder.failed  {domain}  all {MAX_ATTEMPTS} attempts exhausted",
                     level="warning",
                 )
+                rdap_throttle.acquire(stop_event)
                 final_st, final_reg = rdap_lookup(domain)
                 if final_st != "available" and final_reg:
                     with state_lock:

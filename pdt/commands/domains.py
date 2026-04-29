@@ -1,3 +1,6 @@
+import base64
+import shutil
+import subprocess
 import sys
 from datetime import timedelta
 
@@ -231,10 +234,10 @@ def list_domains(machine, sort, show_archived, show_backorders):
         return
 
     key_fns = {
-        "time":      lambda d: remaining(d),
-        "appraisal": lambda d: -(d.get("appraisal") or 0),
+        "time":      lambda d: (d.get("drop_time") or "9999-99-99", d["domain"]),
+        "appraisal": lambda d: (-(d.get("appraisal") or 0), d["domain"]),
         "domain":    lambda d: d["domain"],
-        "status":    lambda d: d.get("status", ""),
+        "status":    lambda d: (d.get("status", ""), d["domain"]),
     }
     domains = sorted(domains, key=key_fns[sort])
 
@@ -394,9 +397,10 @@ def _build_domain_table(
             date_str = local_dt.strftime("%b %d  %H:%M") if local_dt else "—"
 
         flagged     = d.get("flagged", False)
+        spaceship_url = f"https://www.spaceship.com/domain-search/?query={d['domain']}&tab=domains"
         domain_cell = Text(
             ("⚑ " if flagged else "") + redact_domain(d["domain"]),
-            style="bold yellow" if flagged else "bold cyan",
+            style=f"{'bold yellow' if flagged else 'bold cyan'} link {spaceship_url}",
         )
 
         row = []
@@ -478,3 +482,47 @@ def next_cmd(count, machine):
             parts.append(f"[dim]{d['note']}[/dim]")
 
         console.print("  ".join(parts))
+
+
+@click.command("copy")
+@click.argument("target")
+def copy_domain(target):
+    """Copy a domain name to the clipboard.
+
+    TARGET can be a domain name or a 1-based index from 'pdt list'.
+
+    \b
+    Examples:
+      pdt copy 34
+      pdt copy example.com
+    """
+    tracked = load()
+    names   = resolve_targets((target,), tracked)
+    domain  = names[0]
+
+    # OSC 52 — writes directly to the terminal clipboard, no external tools needed.
+    # Supported by kitty, foot, WezTerm, Alacritty, xterm (with allowWindowOps), etc.
+    osc52 = f"\033]52;c;{base64.b64encode(domain.encode()).decode()}\007"
+    sys.stdout.write(osc52)
+    sys.stdout.flush()
+
+    # Fallback: also try system clipboard tools in case OSC 52 isn't supported.
+    _try_system_clipboard(domain)
+
+    console.print(f"[green]✓[/green] [bold cyan]{redact_domain(domain)}[/bold cyan] copied to clipboard")
+
+
+def _try_system_clipboard(text: str) -> bool:
+    """Best-effort copy using system clipboard utilities. Returns True on success."""
+    for cmd in (
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), check=True, capture_output=True)
+                return True
+            except subprocess.CalledProcessError:
+                pass
+    return False

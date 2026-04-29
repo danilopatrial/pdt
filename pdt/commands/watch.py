@@ -17,7 +17,7 @@ from rich.text import Text
 
 from ..constants import LOG_FILE, NOTIFY_WINDOW, PID_FILE
 from ..notifications import send_notification
-from ..rdap import rdap_lookup
+from ..rdap import RdapThrottle, rdap_lookup
 from ..storage import archive_expired, load, save
 from ..utils import (
     console,
@@ -149,8 +149,13 @@ def poll(domains, use_next, interval):
 
         return tbl
 
+    GROUP_SIZE  = 3
+    GROUP_DELAY = 5
+
     def do_poll():
-        for d in domain_list:
+        for i, d in enumerate(domain_list):
+            if len(domain_list) > GROUP_SIZE and i > 0 and i % GROUP_SIZE == 0:
+                time.sleep(GROUP_DELAY)
             new_st, _ = rdap_lookup(d)
             s      = states[d]
             old_st = s["status"]
@@ -216,8 +221,9 @@ def _watch_domains_live(domain_names: list, tracked: list):
             "poll_deadline": None,
         }
 
-    state_lock = threading.Lock()
-    stop_event = threading.Event()
+    state_lock    = threading.Lock()
+    stop_event    = threading.Event()
+    rdap_throttle = RdapThrottle(len(domain_names))
     log_buf: deque = deque(maxlen=50)
 
     # ── Build table ────────────────────────────────────────────────────────────
@@ -330,6 +336,8 @@ def _watch_domains_live(domain_names: list, tracked: list):
 
         # Initial RDAP lookup on first run
         vlog(f"watch.start  {domain}  drop_time={entries[domain].get('drop_time')!r}", domain=domain)
+        if not rdap_throttle.acquire(stop_event):
+            return
         initial_st, initial_reg = rdap_lookup(domain)
         with state_lock:
             s["rdap_status"]  = initial_st
@@ -357,6 +365,8 @@ def _watch_domains_live(domain_names: list, tracked: list):
 
         # Phase 2: poll RDAP until available
         while not stop_event.is_set():
+            if not rdap_throttle.acquire(stop_event):
+                return
             new_st, new_reg = rdap_lookup(domain)
             with state_lock:
                 prev_st = s["rdap_status"]
@@ -374,6 +384,10 @@ def _watch_domains_live(domain_names: list, tracked: list):
                     s["message"] = "RDAP confirmed available"
                 vlog(f"watch.available  {domain}", domain=domain)
                 send_notification(f"✓ {domain} is available!", f"RDAP: {new_st}")
+                import webbrowser
+                webbrowser.open(
+                    f"https://www.spaceship.com/domain-search/?query={domain}&tab=domains"
+                )
                 return
 
             with state_lock:
@@ -467,7 +481,9 @@ def _watch_loop():
 @click.option("-d", "--detach", is_flag=True, help="Run as background daemon")
 @click.option("-v", "--verbose", is_flag=True, default=False,
               help="Show detailed output (same as pdt -v watch)")
-def watch(domains, detach, verbose):
+@click.option("-n", "--next", "use_next", type=int, default=None, metavar="N",
+              help="Watch the next N soonest-dropping tracked domains")
+def watch(domains, detach, verbose, use_next):
     """Watch for dropping domains and notify when they drop and become available.
 
     With no arguments, runs (or detaches) a background daemon that notifies
@@ -487,9 +503,22 @@ def watch(domains, detach, verbose):
       pdt watch -d                   # start daemon in background
       pdt watch example.com          # interactive watch for one domain
       pdt watch 1 3 example.net      # interactive watch for multiple domains
+      pdt watch --next 5             # interactive watch for 5 soonest-dropping domains
     """
     if verbose:
         set_verbose(True)
+
+    if use_next is not None:
+        tracked = load()
+        pool = sorted(
+            (d for d in tracked if not d.get("archived") and d.get("drop_time")),
+            key=lambda d: (d.get("drop_time"), d["domain"]),
+        )[:use_next]
+        if not pool:
+            console.print("[red]No tracked domains with drop times.[/red]")
+            sys.exit(1)
+        _watch_domains_live([d["domain"] for d in pool], tracked)
+        return
 
     if domains:
         # Interactive live watch mode for specific domains

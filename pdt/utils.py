@@ -122,7 +122,13 @@ def find_domain(domains: list, name: str):
 def resolve_targets(
     targets: tuple, domains: list, allow_untracked: bool = False
 ) -> list:
-    """Resolve a mix of domain names and 1-based indices to domain names.
+    """Resolve a mix of domain names, 1-based indices, and index ranges to domain names.
+
+    Supported target forms:
+      example.com      — exact domain name
+      3                — single index
+      1-5              — inclusive range
+      5-               — from index 5 to end of list
 
     Indices match the default 'list' sort order (remaining time, active only).
     Exits on out-of-range index or unknown name (unless allow_untracked=True).
@@ -130,26 +136,40 @@ def resolve_targets(
     """
     active_sorted = sorted(
         [d for d in domains if not d.get("archived")],
-        key=lambda d: remaining(d),
+        key=lambda d: (d.get("drop_time") or "9999-99-99", d["domain"]),
     )
+
+    def _resolve_index(i: int, raw: str) -> str:
+        if i < 0 or i >= len(active_sorted):
+            console.print(f"[red]Index out of range: [bold]{raw}[/bold][/red]")
+            sys.exit(1)
+        return active_sorted[i]["domain"]
+
     resolved = []
     seen: set = set()
     for t in targets:
-        t = str(t)
-        if t.isdigit():
-            idx = int(t) - 1
-            if idx < 0 or idx >= len(active_sorted):
-                console.print(f"[red]Index out of range: [bold]{t}[/bold][/red]")
-                sys.exit(1)
-            name = active_sorted[idx]["domain"]
+        t = str(t).strip()
+        if re.match(r"^\d+-\d+$", t):
+            # Inclusive range: "1-5"
+            a, b = t.split("-")
+            indices = range(int(a) - 1, int(b))
+            names = [_resolve_index(i, t) for i in indices]
+        elif re.match(r"^\d+-$", t):
+            # Open-ended range: "5-"
+            a = int(t.rstrip("-")) - 1
+            names = [_resolve_index(i, t) for i in range(a, len(active_sorted))]
+        elif t.isdigit():
+            names = [_resolve_index(int(t) - 1, t)]
         else:
-            name = t.lower().strip()
+            name = t.lower()
             if not allow_untracked and not any(d["domain"] == name for d in domains):
                 console.print(f"[red]Not found: [bold]{name}[/bold][/red]")
                 sys.exit(1)
-        if name not in seen:
-            seen.add(name)
-            resolved.append(name)
+            names = [name]
+        for name in names:
+            if name not in seen:
+                seen.add(name)
+                resolved.append(name)
     return resolved
 
 
